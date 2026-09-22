@@ -253,11 +253,10 @@ let catModel = null;
 let modelBasePos = new THREE.Vector3();
 let modelSize = new THREE.Vector3(1, 1, 1);
 let modelCenter = new THREE.Vector3();
-let floatAmplitude = 0.03;
+let bounceAmplitude = 0.03;
 
 const clock = new THREE.Clock();
 let elapsedTime = 0;
-let mixer = null;
 
 // Mouse tracking (normalized -1..1)
 const mouse = { x: 0, y: 0 };
@@ -273,103 +272,118 @@ let lookPitch = 0;
 let action = null;
 
 function startAction(type, duration) {
-  action = { type, startTime: clock.getElapsedTime(), duration };
+  action = { type, startTime: elapsedTime, duration };
 }
 
-// TEMPORARY DIAGNOSTIC: force every bone to swing with extreme amplitude
-// so we can see in the viewport whether the skin is actually deforming
-// at all. Set to false once joint movement is confirmed, to restore the
-// head-look / ear-flick / tail-wave behavior below.
-const DEBUG_FORCE_ALL_BONES = true;
+// --- Procedural vertex deformation (bone rig from the Tripo3D export is
+// unusable, so the tail sway / body breathing are done by pushing raw
+// geometry vertices around every frame instead of driving a skeleton) ---
+let deformMeshes = [];
 
-// --- Bone rig helpers ---
-let petBones = { head: null, neck: null, ears: [], tail: [] };
-let allBones = [];
+// Slices the mesh along its longest axis (assumed length axis) and
+// measures the cross-sectional bounding box at each slice. The tail tip
+// is the thin end (small cross-section); the head/body end is thicker.
+function analyzeGeometry(geometry) {
+  const position = geometry.attributes.position;
+  const count = position.count;
+  let zMin = Infinity;
+  let zMax = -Infinity;
+  let yMax = -Infinity;
 
-function collectBones(root) {
-  const bones = [];
-  root.traverse((o) => {
-    if (o.isBone) bones.push(o);
-  });
-  return bones;
-}
-
-// Prints the full node hierarchy (not just bones) with indentation so we
-// can see exactly how bone_N nodes nest - which one is a leaf, which one
-// branches into two (head+ears), etc.
-function logSceneTree(root) {
-  console.log("[cat pet] scene graph:");
-  (function walk(obj, depth) {
-    const indent = "  ".repeat(depth);
-    const tag = obj.isBone ? "Bone" : obj.type;
-    console.log(`${indent}${tag}: ${obj.name || "(unnamed)"}`);
-    obj.children.forEach((c) => walk(c, depth + 1));
-  })(root, 0);
-}
-
-function findByNameRegex(bones, regex) {
-  return bones.filter((b) => regex.test(b.name));
-}
-
-// Walk a single-child bone chain (root -> mid -> tip), stopping at a
-// branch or a leaf.
-function getBoneChain(startBone) {
-  const chain = [startBone];
-  let cur = startBone;
-  while (true) {
-    const children = cur.children.filter((c) => c.isBone);
-    if (children.length !== 1) break;
-    cur = children[0];
-    chain.push(cur);
+  for (let i = 0; i < count; i++) {
+    const z = position.getZ(i);
+    const y = position.getY(i);
+    if (z < zMin) zMin = z;
+    if (z > zMax) zMax = z;
+    if (y > yMax) yMax = y;
   }
-  return chain;
+
+  const buckets = 20;
+  const range = zMax - zMin || 1;
+  const extents = Array.from({ length: buckets }, () => ({
+    xMin: Infinity,
+    xMax: -Infinity,
+    yMin: Infinity,
+    yMax: -Infinity,
+  }));
+
+  for (let i = 0; i < count; i++) {
+    const x = position.getX(i);
+    const y = position.getY(i);
+    const z = position.getZ(i);
+    let b = Math.floor(((z - zMin) / range) * buckets);
+    if (b >= buckets) b = buckets - 1;
+    if (b < 0) b = 0;
+    const e = extents[b];
+    if (x < e.xMin) e.xMin = x;
+    if (x > e.xMax) e.xMax = x;
+    if (y < e.yMin) e.yMin = y;
+    if (y > e.yMax) e.yMax = y;
+  }
+
+  const thickness = extents.map(
+    (e) => Math.max(0, e.xMax - e.xMin) + Math.max(0, e.yMax - e.yMin)
+  );
+  const sample = Math.max(1, Math.round(buckets * 0.15));
+  const startAvg = thickness.slice(0, sample).reduce((a, b) => a + b, 0) / sample;
+  const endAvg = thickness.slice(-sample).reduce((a, b) => a + b, 0) / sample;
+
+  return {
+    zMin,
+    zMax,
+    yMax: yMax || 1,
+    tailAtStart: startAvg < endAvg,
+  };
 }
 
-// cat_rigged.glb uses generic "bone_N" names with no semantic labels, so
-// name matching alone won't find head/neck/ears/tail. We first try names
-// (works for any future, better-labeled rig), then fall back to a
-// structural rule: a bone that branches into exactly two leaf bones is,
-// on a quadruped rig, almost always the head (with the two leaves being
-// the ears) - a shape confirmed by inspecting this file's bind pose.
-function detectPetBones(root) {
-  const bones = collectBones(root);
-  const result = { head: null, neck: null, ears: [], tail: [] };
+// 0 at the head/body end, ramping up to 1 at the tail tip
+function tailFactor(z, info) {
+  const range = info.zMax - info.zMin || 1;
+  const raw = info.tailAtStart ? (info.zMax - z) / range : (z - info.zMin) / range;
+  return Math.max(0, Math.min(1, raw));
+}
 
-  result.head = findByNameRegex(bones, /head|头/i)[0] || null;
-  result.neck = findByNameRegex(bones, /neck|颈/i)[0] || null;
-  result.ears = findByNameRegex(bones, /ear|耳/i);
-  let tailStart = findByNameRegex(bones, /tail|尾/i)[0] || null;
+function registerDeformable(mesh) {
+  const geometry = mesh.geometry;
+  const position = geometry.attributes.position;
+  deformMeshes.push({
+    mesh,
+    base: Float32Array.from(position.array),
+    info: analyzeGeometry(geometry),
+  });
+}
 
-  if (!result.head) {
-    for (const b of bones) {
-      const boneChildren = b.children.filter((c) => c.isBone);
-      const isTwoLeafBranch =
-        boneChildren.length === 2 &&
-        boneChildren.every((c) => c.children.filter((cc) => cc.isBone).length === 0);
-      if (isTwoLeafBranch) {
-        result.head = b;
-        result.ears = boneChildren;
-        if (b.parent && b.parent.isBone) result.neck = b.parent;
-        break;
-      }
+function updateDeformations(t) {
+  deformMeshes.forEach(({ mesh, base, info }) => {
+    const position = mesh.geometry.attributes.position;
+    const arr = position.array;
+    const count = position.count;
+
+    for (let i = 0; i < count; i++) {
+      const ix = i * 3;
+      const bx = base[ix];
+      const by = base[ix + 1];
+      const bz = base[ix + 2];
+
+      // Tail wave: a traveling sine wave along the body's length axis,
+      // masked so it is near-zero at the head/body and strong at the tip
+      const tf = tailFactor(bz, info);
+      const tailAmplitude = 0.06 * Math.pow(tf, 3);
+      const tailSway = Math.sin(t * 3 + bz * 6) * tailAmplitude;
+
+      // Whole-body breathing: a gentle vertical pulse, strongest at the
+      // top of the back and fading out toward the paws on the ground
+      const breatheAmplitude = 0.012 * (by / info.yMax);
+      const breathe = Math.sin(t * 1.6) * breatheAmplitude;
+
+      arr[ix] = bx + tailSway;
+      arr[ix + 1] = by + breathe;
+      arr[ix + 2] = bz;
     }
-  }
 
-  // Known fallback for this specific export's naming scheme, determined
-  // offline from the model's bind-pose bone layout.
-  if (!tailStart) {
-    tailStart = bones.find((b) => b.name === "bone_14") || null;
-  }
-  result.tail = tailStart ? getBoneChain(tailStart) : [];
-
-  console.log("[cat pet] detected bones:", {
-    head: result.head?.name,
-    neck: result.neck?.name,
-    ears: result.ears.map((b) => b.name),
-    tail: result.tail.map((b) => b.name),
+    position.needsUpdate = true;
+    mesh.geometry.computeVertexNormals();
   });
-
-  return result;
 }
 
 // --- Stats ---
@@ -432,6 +446,7 @@ loader.load(
   "./cat_rigged.glb",
   (gltf) => {
     const model = gltf.scene;
+    const skinnedMeshes = [];
 
     model.traverse((child) => {
       if (child.isMesh) {
@@ -439,29 +454,35 @@ loader.load(
         child.receiveShadow = true;
       }
       if (child.isSkinnedMesh) {
-        child.bindMode = "attached";
-        child.pose();
+        skinnedMeshes.push(child);
       }
     });
 
-    logSceneTree(model);
-    petBones = detectPetBones(model);
-    allBones = collectBones(model);
+    // The Tripo3D export's bone rig doesn't drive the mesh correctly, so
+    // we abandon skinning entirely: swap every SkinnedMesh for a plain
+    // Mesh sharing the same geometry/material. This also renders the
+    // geometry's raw authored shape (no more bone-induced pose bugs).
+    skinnedMeshes.forEach((skinned) => {
+      const plain = new THREE.Mesh(skinned.geometry, skinned.material);
+      plain.name = skinned.name;
+      plain.position.copy(skinned.position);
+      plain.rotation.copy(skinned.rotation);
+      plain.scale.copy(skinned.scale);
+      plain.castShadow = true;
+      plain.receiveShadow = true;
+      skinned.parent.add(plain);
+      skinned.parent.remove(skinned);
+    });
 
-    // This export is Z-up, which makes the cat appear lying on its side/
-    // flat on the ground. Rotate the whole rig -90° around X to stand it
-    // upright (flip to +Math.PI / 2 if it ends up facing the wrong way).
-    model.rotation.x = -Math.PI / 2;
-    model.updateMatrixWorld(true);
+    const armature = model.getObjectByName("Armature");
+    if (armature) armature.parent.remove(armature);
 
-    // Play any embedded animation clips, if this export includes them
-    if (gltf.animations && gltf.animations.length > 0) {
-      mixer = new THREE.AnimationMixer(model);
-      gltf.animations.forEach((clip) => mixer.clipAction(clip).play());
-    }
+    deformMeshes = [];
+    model.traverse((child) => {
+      if (child.isMesh) registerDeformable(child);
+    });
 
-    // Center model based on bounding box (computed AFTER the upright fix
-    // above, so it reflects the corrected orientation)
+    // Center model based on bounding box
     const box = new THREE.Box3().setFromObject(model);
     const center = box.getCenter(new THREE.Vector3());
     const size = box.getSize(new THREE.Vector3());
@@ -474,7 +495,7 @@ loader.load(
     catModel = model;
     modelBasePos.copy(model.position);
     modelSize.copy(size);
-    floatAmplitude = Math.max(0.01, size.y * 0.03);
+    bounceAmplitude = Math.max(0.01, size.y * 0.03);
 
     // Recompute ground position under the model
     ground.position.y = 0;
@@ -546,21 +567,16 @@ window.addEventListener("resize", () => {
 // --- Render loop ---
 function animate() {
   requestAnimationFrame(animate);
-  const delta = clock.getDelta();
-  elapsedTime += delta;
+  elapsedTime += clock.getDelta();
   const t = elapsedTime;
 
-  if (mixer) mixer.update(delta);
-
   if (catModel) {
-    // Breathing float (body stays put otherwise - only the head/neck aim
-    // at the pointer, per the rigged-model behavior)
-    const floatOffset = Math.sin(t * 1.5) * floatAmplitude;
+    updateDeformations(t);
 
     let extraY = 0;
     let extraRotY = 0;
+    let extraRotZ = 0;
     let scale = 1;
-    let nod = 0;
 
     if (action) {
       const elapsed = t - action.startTime;
@@ -569,15 +585,16 @@ function animate() {
       if (action.type === "feed") {
         // Happy little bounce
         scale = 1 + Math.sin(p * Math.PI) * 0.12;
-        extraY = Math.sin(p * Math.PI) * floatAmplitude * 1.5;
-        nod = Math.sin(p * Math.PI * 2) * 0.3 * (1 - p);
+        extraY = Math.sin(p * Math.PI) * bounceAmplitude * 1.5;
       } else if (action.type === "pet") {
-        // Happy head-nod, decaying
-        nod = Math.sin(elapsed * 14) * 0.35 * (1 - p);
+        // Happy jitter/shake, decaying
+        const decay = 1 - p;
+        extraRotZ = Math.sin(elapsed * 40) * 0.08 * decay;
+        extraY = Math.abs(Math.sin(elapsed * 25)) * bounceAmplitude * decay;
       } else if (action.type === "play") {
         // Full 360 spin
         extraRotY = p * Math.PI * 2;
-        extraY = Math.sin(p * Math.PI) * floatAmplitude * 2;
+        extraY = Math.sin(p * Math.PI) * bounceAmplitude * 2;
       }
 
       if (p >= 1) {
@@ -585,51 +602,17 @@ function animate() {
       }
     }
 
-    catModel.position.y = modelBasePos.y + floatOffset + extraY;
-    catModel.rotation.y = extraRotY;
+    // Subtle whole-body look-toward-mouse (no head bone to drive anymore)
+    const targetYaw = mouse.x * 0.25;
+    const targetPitch = -mouse.y * 0.08;
+    lookYaw += (targetYaw - lookYaw) * 0.05;
+    lookPitch += (targetPitch - lookPitch) * 0.05;
+
+    catModel.position.y = modelBasePos.y + extraY;
+    catModel.rotation.y = lookYaw + extraRotY;
+    catModel.rotation.x = lookPitch;
+    catModel.rotation.z = extraRotZ;
     catModel.scale.setScalar(scale);
-
-    if (DEBUG_FORCE_ALL_BONES) {
-      // EXTREME TEST: slam every single bone's y/z rotation with a big
-      // sine wave. If the mesh visibly warps/thrashes, skinning works
-      // and the earlier subtle animation just needs bigger numbers. If
-      // NOTHING moves even at this amplitude, the skin binding itself
-      // (bone weights / inverse bind matrices) is broken in the export.
-      allBones.forEach((bone, i) => {
-        bone.rotation.z = Math.sin(t * 3 + i * 0.3) * 0.5;
-        bone.rotation.y = Math.sin(t * 3 + i * 0.3 + 1.0) * 0.5;
-      });
-    } else {
-      // Head/neck independently aim at the mouse pointer (smoothed with a
-      // lerp) while the body stays stable, plus a gentle idle up/down bob
-      const targetYaw = mouse.x * 0.6;
-      const targetPitch = -mouse.y * 0.3;
-      lookYaw += (targetYaw - lookYaw) * 0.08;
-      lookPitch += (targetPitch - lookPitch) * 0.08;
-      const idleNod = Math.sin(t * 1.8) * 0.15;
-
-      if (petBones.neck) {
-        petBones.neck.rotation.y = lookYaw * 0.35;
-        petBones.neck.rotation.x = lookPitch * 0.35 + idleNod * 0.4 + nod * 0.4;
-      }
-      if (petBones.head) {
-        petBones.head.rotation.y = lookYaw * 0.65;
-        petBones.head.rotation.x = lookPitch * 0.65 + idleNod * 0.6 + nod * 0.6;
-      }
-
-      // Idle micro-motion: ears flick, tail sways as a hierarchical wave
-      // with amplitude increasing toward the tip
-      petBones.ears.forEach((ear, i) => {
-        ear.rotation.z = Math.sin(t * 2.2 + i * 1.7) * 0.3;
-        ear.rotation.x = Math.sin(t * 1.6 + i * 2.3) * 0.15;
-      });
-
-      petBones.tail.forEach((segment, i) => {
-        const amplitude = 0.18 + i * 0.06;
-        segment.rotation.y = Math.sin(t * 1.4 - i * 0.8) * amplitude;
-        segment.rotation.z = Math.sin(t * 1.1 - i * 0.8) * amplitude * 0.6;
-      });
-    }
   }
 
   updateBubblePosition();

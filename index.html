@@ -275,117 +275,6 @@ function startAction(type, duration) {
   action = { type, startTime: elapsedTime, duration };
 }
 
-// --- Procedural vertex deformation (bone rig from the Tripo3D export is
-// unusable, so the tail sway / body breathing are done by pushing raw
-// geometry vertices around every frame instead of driving a skeleton) ---
-let deformMeshes = [];
-
-// Slices the mesh along its longest axis (assumed length axis) and
-// measures the cross-sectional bounding box at each slice. The tail tip
-// is the thin end (small cross-section); the head/body end is thicker.
-function analyzeGeometry(geometry) {
-  const position = geometry.attributes.position;
-  const count = position.count;
-  let zMin = Infinity;
-  let zMax = -Infinity;
-  let yMax = -Infinity;
-
-  for (let i = 0; i < count; i++) {
-    const z = position.getZ(i);
-    const y = position.getY(i);
-    if (z < zMin) zMin = z;
-    if (z > zMax) zMax = z;
-    if (y > yMax) yMax = y;
-  }
-
-  const buckets = 20;
-  const range = zMax - zMin || 1;
-  const extents = Array.from({ length: buckets }, () => ({
-    xMin: Infinity,
-    xMax: -Infinity,
-    yMin: Infinity,
-    yMax: -Infinity,
-  }));
-
-  for (let i = 0; i < count; i++) {
-    const x = position.getX(i);
-    const y = position.getY(i);
-    const z = position.getZ(i);
-    let b = Math.floor(((z - zMin) / range) * buckets);
-    if (b >= buckets) b = buckets - 1;
-    if (b < 0) b = 0;
-    const e = extents[b];
-    if (x < e.xMin) e.xMin = x;
-    if (x > e.xMax) e.xMax = x;
-    if (y < e.yMin) e.yMin = y;
-    if (y > e.yMax) e.yMax = y;
-  }
-
-  const thickness = extents.map(
-    (e) => Math.max(0, e.xMax - e.xMin) + Math.max(0, e.yMax - e.yMin)
-  );
-  const sample = Math.max(1, Math.round(buckets * 0.15));
-  const startAvg = thickness.slice(0, sample).reduce((a, b) => a + b, 0) / sample;
-  const endAvg = thickness.slice(-sample).reduce((a, b) => a + b, 0) / sample;
-
-  return {
-    zMin,
-    zMax,
-    yMax: yMax || 1,
-    tailAtStart: startAvg < endAvg,
-  };
-}
-
-// 0 at the head/body end, ramping up to 1 at the tail tip
-function tailFactor(z, info) {
-  const range = info.zMax - info.zMin || 1;
-  const raw = info.tailAtStart ? (info.zMax - z) / range : (z - info.zMin) / range;
-  return Math.max(0, Math.min(1, raw));
-}
-
-function registerDeformable(mesh) {
-  const geometry = mesh.geometry;
-  const position = geometry.attributes.position;
-  deformMeshes.push({
-    mesh,
-    base: Float32Array.from(position.array),
-    info: analyzeGeometry(geometry),
-  });
-}
-
-function updateDeformations(t) {
-  deformMeshes.forEach(({ mesh, base, info }) => {
-    const position = mesh.geometry.attributes.position;
-    const arr = position.array;
-    const count = position.count;
-
-    for (let i = 0; i < count; i++) {
-      const ix = i * 3;
-      const bx = base[ix];
-      const by = base[ix + 1];
-      const bz = base[ix + 2];
-
-      // Tail wave: a traveling sine wave along the body's length axis,
-      // masked so it is near-zero at the head/body and strong at the tip
-      const tf = tailFactor(bz, info);
-      const tailAmplitude = 0.06 * Math.pow(tf, 3);
-      const tailSway = Math.sin(t * 3 + bz * 6) * tailAmplitude;
-
-      // Whole-body breathing: a gentle vertical pulse, strongest at the
-      // top of the back and fading out toward the paws on the ground
-      const breatheAmplitude = 0.012 * (by / info.yMax);
-      const breathe = Math.sin(t * 1.6) * breatheAmplitude;
-
-      arr[ix] = bx + tailSway;
-      arr[ix + 1] = by + breathe;
-      arr[ix + 2] = bz;
-    }
-
-    position.needsUpdate = true;
-    mesh.geometry.computeVertexNormals();
-  });
-}
-
 // --- Stats ---
 const stats = { fullness: 70, mood: 70 };
 const fullnessFill = document.getElementById("fullness-fill");
@@ -445,81 +334,83 @@ const loader = new GLTFLoader();
 loader.load(
   "./cat_rigged.glb",
   (gltf) => {
-    const model = gltf.scene;
-    const skinnedMeshes = [];
-
-    model.traverse((child) => {
-      if (child.isMesh) {
-        child.castShadow = true;
-        child.receiveShadow = true;
+    try {
+      const model = gltf.scene;
+      if (!model) {
+        showError("GLTF file has no scene to display.");
+        return;
       }
-      if (child.isSkinnedMesh) {
-        skinnedMeshes.push(child);
-      }
-    });
 
-    // The Tripo3D export's bone rig doesn't drive the mesh correctly, so
-    // we abandon skinning entirely: swap every SkinnedMesh for a plain
-    // Mesh sharing the same geometry/material. This also renders the
-    // geometry's raw authored shape (no more bone-induced pose bugs).
-    skinnedMeshes.forEach((skinned) => {
-      const plain = new THREE.Mesh(skinned.geometry, skinned.material);
-      plain.name = skinned.name;
-      plain.position.copy(skinned.position);
-      plain.rotation.copy(skinned.rotation);
-      plain.scale.copy(skinned.scale);
-      plain.castShadow = true;
-      plain.receiveShadow = true;
-      skinned.parent.add(plain);
-      skinned.parent.remove(skinned);
-    });
+      // The Tripo3D export's bone rig doesn't drive the mesh correctly.
+      // Rather than rely on skinning at all, swap every SkinnedMesh for a
+      // plain Mesh sharing the same geometry/material - this renders the
+      // geometry's raw authored (already correctly posed) shape and
+      // sidesteps any bone-related rendering issues entirely.
+      const skinnedMeshes = [];
+      model.traverse((child) => {
+        if (child.isMesh) {
+          child.castShadow = true;
+          child.receiveShadow = true;
+        }
+        if (child.isSkinnedMesh) {
+          skinnedMeshes.push(child);
+        }
+      });
 
-    const armature = model.getObjectByName("Armature");
-    if (armature) armature.parent.remove(armature);
+      skinnedMeshes.forEach((skinned) => {
+        if (!skinned.parent || !skinned.geometry || !skinned.material) return;
+        const plain = new THREE.Mesh(skinned.geometry, skinned.material);
+        plain.name = skinned.name;
+        plain.position.copy(skinned.position);
+        plain.rotation.copy(skinned.rotation);
+        plain.scale.copy(skinned.scale);
+        plain.castShadow = true;
+        plain.receiveShadow = true;
+        skinned.parent.add(plain);
+        skinned.parent.remove(skinned);
+      });
 
-    deformMeshes = [];
-    model.traverse((child) => {
-      if (child.isMesh) registerDeformable(child);
-    });
+      // Center model based on bounding box
+      const box = new THREE.Box3().setFromObject(model);
+      const center = box.getCenter(new THREE.Vector3());
+      const size = box.getSize(new THREE.Vector3());
 
-    // Center model based on bounding box
-    const box = new THREE.Box3().setFromObject(model);
-    const center = box.getCenter(new THREE.Vector3());
-    const size = box.getSize(new THREE.Vector3());
+      model.position.x -= center.x;
+      model.position.y -= box.min.y; // sit on ground (y = 0)
+      model.position.z -= center.z;
 
-    model.position.x -= center.x;
-    model.position.y -= box.min.y; // sit on ground (y = 0)
-    model.position.z -= center.z;
+      scene.add(model);
+      catModel = model;
+      modelBasePos.copy(model.position);
+      modelSize.copy(size);
+      bounceAmplitude = Math.max(0.01, size.y * 0.03);
 
-    scene.add(model);
-    catModel = model;
-    modelBasePos.copy(model.position);
-    modelSize.copy(size);
-    bounceAmplitude = Math.max(0.01, size.y * 0.03);
+      // Recompute ground position under the model
+      ground.position.y = 0;
 
-    // Recompute ground position under the model
-    ground.position.y = 0;
+      // Fit camera distance to bounding sphere
+      const maxDim = Math.max(size.x, size.y, size.z);
+      const fov = camera.fov * (Math.PI / 180);
+      let distance = (maxDim / 2) / Math.tan(fov / 2);
+      distance *= 1.8; // padding so model isn't edge-to-edge
 
-    // Fit camera distance to bounding sphere
-    const maxDim = Math.max(size.x, size.y, size.z);
-    const fov = camera.fov * (Math.PI / 180);
-    let distance = (maxDim / 2) / Math.tan(fov / 2);
-    distance *= 1.8; // padding so model isn't edge-to-edge
+      modelCenter.set(0, size.y / 2, 0);
+      camera.position.set(
+        modelCenter.x + distance * 0.6,
+        modelCenter.y + distance * 0.4,
+        modelCenter.z + distance * 0.8
+      );
+      camera.near = distance / 100;
+      camera.far = distance * 100;
+      camera.updateProjectionMatrix();
 
-    modelCenter.set(0, size.y / 2, 0);
-    camera.position.set(
-      modelCenter.x + distance * 0.6,
-      modelCenter.y + distance * 0.4,
-      modelCenter.z + distance * 0.8
-    );
-    camera.near = distance / 100;
-    camera.far = distance * 100;
-    camera.updateProjectionMatrix();
+      controls.target.copy(modelCenter);
+      controls.update();
 
-    controls.target.copy(modelCenter);
-    controls.update();
-
-    overlay.style.display = "none";
+      overlay.style.display = "none";
+    } catch (err) {
+      showError(err && err.message ? err.message : String(err));
+    }
   },
   (progress) => {
     if (progress.total > 0) {
@@ -565,59 +456,72 @@ window.addEventListener("resize", () => {
 });
 
 // --- Render loop ---
+// Everything here is a plain Object3D transform (position/rotation/scale)
+// - no raw geometry/vertex-buffer access - so a bad frame can never leave
+// the mesh in a broken state, and the try/catch below guarantees the
+// requestAnimationFrame loop keeps going even if something unexpected throws.
 function animate() {
   requestAnimationFrame(animate);
-  elapsedTime += clock.getDelta();
-  const t = elapsedTime;
 
-  if (catModel) {
-    updateDeformations(t);
+  try {
+    elapsedTime += clock.getDelta();
+    const t = elapsedTime;
 
-    let extraY = 0;
-    let extraRotY = 0;
-    let extraRotZ = 0;
-    let scale = 1;
+    if (catModel) {
+      let extraY = 0;
+      let extraRotY = 0;
+      let extraRotZ = 0;
+      let scale = 1;
 
-    if (action) {
-      const elapsed = t - action.startTime;
-      const p = clamp(elapsed / action.duration, 0, 1);
+      if (action) {
+        const elapsed = t - action.startTime;
+        const p = clamp(elapsed / action.duration, 0, 1);
 
-      if (action.type === "feed") {
-        // Happy little bounce
-        scale = 1 + Math.sin(p * Math.PI) * 0.12;
-        extraY = Math.sin(p * Math.PI) * bounceAmplitude * 1.5;
-      } else if (action.type === "pet") {
-        // Happy jitter/shake, decaying
-        const decay = 1 - p;
-        extraRotZ = Math.sin(elapsed * 40) * 0.08 * decay;
-        extraY = Math.abs(Math.sin(elapsed * 25)) * bounceAmplitude * decay;
-      } else if (action.type === "play") {
-        // Full 360 spin
-        extraRotY = p * Math.PI * 2;
-        extraY = Math.sin(p * Math.PI) * bounceAmplitude * 2;
+        if (action.type === "feed") {
+          // Happy little bounce
+          scale = 1 + Math.sin(p * Math.PI) * 0.12;
+          extraY = Math.sin(p * Math.PI) * bounceAmplitude * 1.5;
+        } else if (action.type === "pet") {
+          // Happy jitter/shake, decaying
+          const decay = 1 - p;
+          extraRotZ = Math.sin(elapsed * 40) * 0.08 * decay;
+          extraY = Math.abs(Math.sin(elapsed * 25)) * bounceAmplitude * decay;
+        } else if (action.type === "play") {
+          // Full 360 spin
+          extraRotY = p * Math.PI * 2;
+          extraY = Math.sin(p * Math.PI) * bounceAmplitude * 2;
+        }
+
+        if (p >= 1) {
+          action = null;
+        }
       }
 
-      if (p >= 1) {
-        action = null;
-      }
+      // Safe layered idle motion: gentle breathing bob, a gentle side-to-side
+      // tilt (stands in for tail/body sway), plus mouse-follow yaw - all pure
+      // whole-model transforms, never touching geometry vertex data.
+      const breathe = Math.sin(t * 1.5) * bounceAmplitude;
+      const idleTilt = Math.sin(t * 2) * 0.05;
+      const idleSway = Math.sin(t * 0.8) * 0.03;
+
+      const targetYaw = mouse.x * 0.25;
+      const targetPitch = -mouse.y * 0.08;
+      lookYaw += (targetYaw - lookYaw) * 0.05;
+      lookPitch += (targetPitch - lookPitch) * 0.05;
+
+      catModel.position.y = modelBasePos.y + breathe + extraY;
+      catModel.rotation.y = lookYaw + idleSway + extraRotY;
+      catModel.rotation.x = lookPitch;
+      catModel.rotation.z = idleTilt + extraRotZ;
+      catModel.scale.setScalar(scale);
     }
 
-    // Subtle whole-body look-toward-mouse (no head bone to drive anymore)
-    const targetYaw = mouse.x * 0.25;
-    const targetPitch = -mouse.y * 0.08;
-    lookYaw += (targetYaw - lookYaw) * 0.05;
-    lookPitch += (targetPitch - lookPitch) * 0.05;
-
-    catModel.position.y = modelBasePos.y + extraY;
-    catModel.rotation.y = lookYaw + extraRotY;
-    catModel.rotation.x = lookPitch;
-    catModel.rotation.z = extraRotZ;
-    catModel.scale.setScalar(scale);
+    updateBubblePosition();
+    controls.update();
+    renderer.render(scene, camera);
+  } catch (err) {
+    console.error("[cat pet] animate() error:", err);
   }
-
-  updateBubblePosition();
-  controls.update();
-  renderer.render(scene, camera);
 }
 animate();
 

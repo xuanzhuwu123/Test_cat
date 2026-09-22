@@ -256,6 +256,8 @@ let modelCenter = new THREE.Vector3();
 let floatAmplitude = 0.03;
 
 const clock = new THREE.Clock();
+let elapsedTime = 0;
+let mixer = null;
 
 // Mouse tracking (normalized -1..1)
 const mouse = { x: 0, y: 0 };
@@ -420,7 +422,20 @@ loader.load(
 
     petBones = detectPetBones(model);
 
-    // Center model based on bounding box
+    // This export is Z-up, which makes the cat appear lying on its side/
+    // flat on the ground. Rotate the whole rig -90° around X to stand it
+    // upright (flip to +Math.PI / 2 if it ends up facing the wrong way).
+    model.rotation.x = -Math.PI / 2;
+    model.updateMatrixWorld(true);
+
+    // Play any embedded animation clips, if this export includes them
+    if (gltf.animations && gltf.animations.length > 0) {
+      mixer = new THREE.AnimationMixer(model);
+      gltf.animations.forEach((clip) => mixer.clipAction(clip).play());
+    }
+
+    // Center model based on bounding box (computed AFTER the upright fix
+    // above, so it reflects the corrected orientation)
     const box = new THREE.Box3().setFromObject(model);
     const center = box.getCenter(new THREE.Vector3());
     const size = box.getSize(new THREE.Vector3());
@@ -505,7 +520,11 @@ window.addEventListener("resize", () => {
 // --- Render loop ---
 function animate() {
   requestAnimationFrame(animate);
-  const t = clock.getElapsedTime();
+  const delta = clock.getDelta();
+  elapsedTime += delta;
+  const t = elapsedTime;
+
+  if (mixer) mixer.update(delta);
 
   if (catModel) {
     // Breathing float (body stays put otherwise - only the head/neck aim
@@ -544,31 +563,35 @@ function animate() {
     catModel.rotation.y = extraRotY;
     catModel.scale.setScalar(scale);
 
-    // Head/neck independently aim at the mouse pointer while the body
-    // stays stable
-    const targetYaw = mouse.x * 0.5;
-    const targetPitch = -mouse.y * 0.25;
+    // Head/neck independently aim at the mouse pointer (smoothed with a
+    // lerp) while the body stays stable, plus a gentle idle up/down bob
+    const targetYaw = mouse.x * 0.6;
+    const targetPitch = -mouse.y * 0.3;
     lookYaw += (targetYaw - lookYaw) * 0.08;
     lookPitch += (targetPitch - lookPitch) * 0.08;
+    const idleNod = Math.sin(t * 1.8) * 0.15;
 
     if (petBones.neck) {
       petBones.neck.rotation.y = lookYaw * 0.35;
-      petBones.neck.rotation.x = lookPitch * 0.35 + nod * 0.4;
+      petBones.neck.rotation.x = lookPitch * 0.35 + idleNod * 0.4 + nod * 0.4;
     }
     if (petBones.head) {
       petBones.head.rotation.y = lookYaw * 0.65;
-      petBones.head.rotation.x = lookPitch * 0.65 + nod * 0.6;
+      petBones.head.rotation.x = lookPitch * 0.65 + idleNod * 0.6 + nod * 0.6;
     }
 
-    // Idle micro-motion: ears flick, tail sways in a trailing wave
+    // Idle micro-motion (forced sine-driven fallback since this rig has
+    // no embedded animation clips): ears flick, tail sways as a
+    // hierarchical wave with amplitude increasing toward the tip
     petBones.ears.forEach((ear, i) => {
-      ear.rotation.z = Math.sin(t * 2.2 + i * 1.7) * 0.15;
-      ear.rotation.x = Math.sin(t * 1.6 + i * 2.3) * 0.08;
+      ear.rotation.z = Math.sin(t * 2.2 + i * 1.7) * 0.3;
+      ear.rotation.x = Math.sin(t * 1.6 + i * 2.3) * 0.15;
     });
 
     petBones.tail.forEach((segment, i) => {
-      const amplitude = 0.12 + i * 0.08;
+      const amplitude = 0.18 + i * 0.06;
       segment.rotation.y = Math.sin(t * 1.4 - i * 0.8) * amplitude;
+      segment.rotation.z = Math.sin(t * 1.1 - i * 0.8) * amplitude * 0.6;
     });
   }
 

@@ -276,8 +276,15 @@ function startAction(type, duration) {
   action = { type, startTime: clock.getElapsedTime(), duration };
 }
 
+// TEMPORARY DIAGNOSTIC: force every bone to swing with extreme amplitude
+// so we can see in the viewport whether the skin is actually deforming
+// at all. Set to false once joint movement is confirmed, to restore the
+// head-look / ear-flick / tail-wave behavior below.
+const DEBUG_FORCE_ALL_BONES = true;
+
 // --- Bone rig helpers ---
 let petBones = { head: null, neck: null, ears: [], tail: [] };
+let allBones = [];
 
 function collectBones(root) {
   const bones = [];
@@ -285,6 +292,19 @@ function collectBones(root) {
     if (o.isBone) bones.push(o);
   });
   return bones;
+}
+
+// Prints the full node hierarchy (not just bones) with indentation so we
+// can see exactly how bone_N nodes nest - which one is a leaf, which one
+// branches into two (head+ears), etc.
+function logSceneTree(root) {
+  console.log("[cat pet] scene graph:");
+  (function walk(obj, depth) {
+    const indent = "  ".repeat(depth);
+    const tag = obj.isBone ? "Bone" : obj.type;
+    console.log(`${indent}${tag}: ${obj.name || "(unnamed)"}`);
+    obj.children.forEach((c) => walk(c, depth + 1));
+  })(root, 0);
 }
 
 function findByNameRegex(bones, regex) {
@@ -418,9 +438,15 @@ loader.load(
         child.castShadow = true;
         child.receiveShadow = true;
       }
+      if (child.isSkinnedMesh) {
+        child.bindMode = "attached";
+        child.pose();
+      }
     });
 
+    logSceneTree(model);
     petBones = detectPetBones(model);
+    allBones = collectBones(model);
 
     // This export is Z-up, which makes the cat appear lying on its side/
     // flat on the ground. Rotate the whole rig -90° around X to stand it
@@ -563,36 +589,47 @@ function animate() {
     catModel.rotation.y = extraRotY;
     catModel.scale.setScalar(scale);
 
-    // Head/neck independently aim at the mouse pointer (smoothed with a
-    // lerp) while the body stays stable, plus a gentle idle up/down bob
-    const targetYaw = mouse.x * 0.6;
-    const targetPitch = -mouse.y * 0.3;
-    lookYaw += (targetYaw - lookYaw) * 0.08;
-    lookPitch += (targetPitch - lookPitch) * 0.08;
-    const idleNod = Math.sin(t * 1.8) * 0.15;
+    if (DEBUG_FORCE_ALL_BONES) {
+      // EXTREME TEST: slam every single bone's y/z rotation with a big
+      // sine wave. If the mesh visibly warps/thrashes, skinning works
+      // and the earlier subtle animation just needs bigger numbers. If
+      // NOTHING moves even at this amplitude, the skin binding itself
+      // (bone weights / inverse bind matrices) is broken in the export.
+      allBones.forEach((bone, i) => {
+        bone.rotation.z = Math.sin(t * 3 + i * 0.3) * 0.5;
+        bone.rotation.y = Math.sin(t * 3 + i * 0.3 + 1.0) * 0.5;
+      });
+    } else {
+      // Head/neck independently aim at the mouse pointer (smoothed with a
+      // lerp) while the body stays stable, plus a gentle idle up/down bob
+      const targetYaw = mouse.x * 0.6;
+      const targetPitch = -mouse.y * 0.3;
+      lookYaw += (targetYaw - lookYaw) * 0.08;
+      lookPitch += (targetPitch - lookPitch) * 0.08;
+      const idleNod = Math.sin(t * 1.8) * 0.15;
 
-    if (petBones.neck) {
-      petBones.neck.rotation.y = lookYaw * 0.35;
-      petBones.neck.rotation.x = lookPitch * 0.35 + idleNod * 0.4 + nod * 0.4;
+      if (petBones.neck) {
+        petBones.neck.rotation.y = lookYaw * 0.35;
+        petBones.neck.rotation.x = lookPitch * 0.35 + idleNod * 0.4 + nod * 0.4;
+      }
+      if (petBones.head) {
+        petBones.head.rotation.y = lookYaw * 0.65;
+        petBones.head.rotation.x = lookPitch * 0.65 + idleNod * 0.6 + nod * 0.6;
+      }
+
+      // Idle micro-motion: ears flick, tail sways as a hierarchical wave
+      // with amplitude increasing toward the tip
+      petBones.ears.forEach((ear, i) => {
+        ear.rotation.z = Math.sin(t * 2.2 + i * 1.7) * 0.3;
+        ear.rotation.x = Math.sin(t * 1.6 + i * 2.3) * 0.15;
+      });
+
+      petBones.tail.forEach((segment, i) => {
+        const amplitude = 0.18 + i * 0.06;
+        segment.rotation.y = Math.sin(t * 1.4 - i * 0.8) * amplitude;
+        segment.rotation.z = Math.sin(t * 1.1 - i * 0.8) * amplitude * 0.6;
+      });
     }
-    if (petBones.head) {
-      petBones.head.rotation.y = lookYaw * 0.65;
-      petBones.head.rotation.x = lookPitch * 0.65 + idleNod * 0.6 + nod * 0.6;
-    }
-
-    // Idle micro-motion (forced sine-driven fallback since this rig has
-    // no embedded animation clips): ears flick, tail sways as a
-    // hierarchical wave with amplitude increasing toward the tip
-    petBones.ears.forEach((ear, i) => {
-      ear.rotation.z = Math.sin(t * 2.2 + i * 1.7) * 0.3;
-      ear.rotation.x = Math.sin(t * 1.6 + i * 2.3) * 0.15;
-    });
-
-    petBones.tail.forEach((segment, i) => {
-      const amplitude = 0.18 + i * 0.06;
-      segment.rotation.y = Math.sin(t * 1.4 - i * 0.8) * amplitude;
-      segment.rotation.z = Math.sin(t * 1.1 - i * 0.8) * amplitude * 0.6;
-    });
   }
 
   updateBubblePosition();
